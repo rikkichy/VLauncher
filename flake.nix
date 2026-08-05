@@ -1,5 +1,4 @@
 {
-
   description = "vhelper - make VTubing suck less on Linux";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -32,9 +31,16 @@
               libadwaita
             ];
 
+            # Makefile only has install/uninstall targets.
             dontBuild = true;
             installFlags = [ "PREFIX=${placeholder "out"}" ];
 
+            # The upstream bin/vhelper launcher searches /usr/local/share,
+            # /usr/share and XDG_DATA_HOME -- none of which exist here.
+            # Replace it with a direct wrapper that pins the right python
+            # (with PyGObject) and puts protontricks on PATH. dontWrapGApps
+            # + manual wrap is the documented pattern to avoid double
+            # wrapping while still getting GI/GSettings env from the hook.
             dontWrapGApps = true;
             preFixup = ''
               rm $out/bin/vhelper
