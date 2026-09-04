@@ -133,6 +133,105 @@ def load_config():
     return {}
 
 
+def _process_environment_value(proc_dir, name):
+    """Read one environment value from a process, tolerating process exits."""
+    try:
+        entries = (proc_dir / "environ").read_bytes().split(b"\0")
+    except (OSError, PermissionError):
+        return None
+    prefix = os.fsencode(name) + b"="
+    for entry in entries:
+        if entry.startswith(prefix):
+            return os.fsdecode(entry[len(prefix):])
+    return None
+
+
+def find_vts_process():
+    """Return a VTube Studio process using its expected Wine prefix."""
+    try:
+        processes = Path("/proc").iterdir()
+    except OSError:
+        return None
+    for proc_dir in processes:
+        if not proc_dir.name.isdigit():
+            continue
+        try:
+            argv = (proc_dir / "cmdline").read_bytes().split(b"\0")
+        except (OSError, PermissionError):
+            continue
+        if not argv or not argv[0]:
+            continue
+        executable = os.fsdecode(argv[0]).replace("\\", "/").rsplit("/", 1)[-1]
+        if executable.casefold() != "vtube studio.exe":
+            continue
+        prefix = _process_environment_value(proc_dir, "WINEPREFIX")
+        if not prefix:
+            continue
+        try:
+            if Path(prefix).resolve() == VTS_PREFIX.resolve():
+                return int(proc_dir.name)
+        except OSError:
+            continue
+    return None
+
+
+def _protontricks_disables_steam_runtime(launcher):
+    """Detect wrappers that force protontricks out of Steam Runtime."""
+    try:
+        text = Path(launcher).read_text(errors="ignore")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        normalized = line.replace(" ", "").replace("'", "").replace('"', "")
+        if normalized in ("STEAM_RUNTIME=0", "exportSTEAM_RUNTIME=0"):
+            return True
+    return False
+
+
+def inspect_shoost_launch_runtime():
+    """Return (safe, summary, blocker) for launching Shoost right now."""
+    launcher = shutil.which("protontricks-launch")
+    if not launcher:
+        blocker = "protontricks-launch is not available."
+        return False, "protontricks-launch not found", blocker
+
+    vts_pid = find_vts_process()
+    if vts_pid is None:
+        blocker = (
+            "VTube Studio is not running. Start it from Steam before launching "
+            "Shoost so VHelper can verify that both applications will share "
+            "the same Wine runtime."
+        )
+        return False, "Not running", blocker
+
+    try:
+        host_tmp = os.stat("/tmp")
+        vts_tmp = os.stat(f"/proc/{vts_pid}/root/tmp")
+        private_runtime = (
+            host_tmp.st_dev != vts_tmp.st_dev
+            or host_tmp.st_ino != vts_tmp.st_ino
+        )
+    except (OSError, PermissionError):
+        blocker = (
+            f"VTube Studio is running as PID {vts_pid}, but VHelper cannot "
+            "inspect its Steam Runtime. Shoost was not launched because "
+            "Spout2 requires both applications to share one Wine server."
+        )
+        return False, f"Runtime inspection failed (PID {vts_pid})", blocker
+
+    if private_runtime and _protontricks_disables_steam_runtime(launcher):
+        blocker = (
+            "VTube Studio is running in a private Steam container, while this "
+            "protontricks-launch package disables Steam Runtime. Launching "
+            "Shoost would create a second Wine server, so it cannot see VTube "
+            "Studio's Spout2 sender. Launch both applications from one "
+            "Steam/Proton runtime instead."
+        )
+        return False, f"Isolated from protontricks (PID {vts_pid})", blocker
+
+    return True, f"Compatible runtime detected (PID {vts_pid})", None
+
+
 class VHelperWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="VHelper", default_width=520, default_height=580)
@@ -143,6 +242,7 @@ class VHelperWindow(Adw.ApplicationWindow):
         self.install_prefix = detect_vhelper_install()
         self.bundled_spout2pw = find_bundled_spout2pw()
         self.bundled_obs_pwvideo = find_bundled_obs_pwvideo()
+        self.shoost_launch_runtime = inspect_shoost_launch_runtime()
 
         if not find_spout2pw() and self.bundled_spout2pw:
             try:
@@ -168,6 +268,9 @@ class VHelperWindow(Adw.ApplicationWindow):
 
         self._apply_view()
         self._update_buttons()
+        self._runtime_check_source = GLib.timeout_add_seconds(
+            2, self._poll_shoost_launch_runtime
+        )
 
     def _build_main_view(self):
         """Construct the normal vhelper body. Always built — even when the
@@ -188,6 +291,10 @@ class VHelperWindow(Adw.ApplicationWindow):
         self.vts_row = Adw.ActionRow(title="VTube Studio Prefix")
         self._update_vts_status()
         status_group.add(self.vts_row)
+
+        self.vts_runtime_row = Adw.ActionRow(title="VTube Studio Process")
+        self._update_vts_runtime_status()
+        status_group.add(self.vts_runtime_row)
 
         self.proton_row = Adw.ActionRow(title="Proton Runtime")
         self._update_proton_status()
@@ -220,20 +327,20 @@ class VHelperWindow(Adw.ApplicationWindow):
         extract_row.set_activatable_widget(self.extract_btn)
         shoost_group.add(extract_row)
 
-        launch_row = Adw.ActionRow(
+        self.launch_row = Adw.ActionRow(
             title="Launch Shoost",
-            subtitle="Run inside VTS's container via protontricks",
+            subtitle="Runtime compatibility is checked continuously",
         )
         info_btn = Gtk.Button(icon_name="dialog-information-symbolic", valign=Gtk.Align.CENTER)
         info_btn.set_tooltip_text("Show terminal command")
         info_btn.connect("clicked", self.on_show_shoost_command)
-        launch_row.add_suffix(info_btn)
+        self.launch_row.add_suffix(info_btn)
         self.launch_btn = Gtk.Button(label="Launch", valign=Gtk.Align.CENTER)
         self.launch_btn.add_css_class("suggested-action")
         self.launch_btn.connect("clicked", self.on_launch_shoost)
-        launch_row.add_suffix(self.launch_btn)
-        launch_row.set_activatable_widget(self.launch_btn)
-        shoost_group.add(launch_row)
+        self.launch_row.add_suffix(self.launch_btn)
+        self.launch_row.set_activatable_widget(self.launch_btn)
+        shoost_group.add(self.launch_row)
 
         stop_row = Adw.ActionRow(
             title="Stop Shoost",
@@ -394,6 +501,18 @@ class VHelperWindow(Adw.ApplicationWindow):
         else:
             self._set_row_status(self.vts_row, "Not found", False)
 
+    def _update_vts_runtime_status(self):
+        safe, summary, _blocker = self.shoost_launch_runtime
+        self._set_row_status(self.vts_runtime_row, summary, safe)
+
+    def _poll_shoost_launch_runtime(self):
+        state = inspect_shoost_launch_runtime()
+        if state != self.shoost_launch_runtime:
+            self.shoost_launch_runtime = state
+            self._update_vts_runtime_status()
+            self._update_buttons()
+        return True
+
     def _update_proton_status(self):
         self.proton_path = detect_proton_from_config()
         name = self.proton_path.name if self.proton_path else "Not detected"
@@ -420,7 +539,10 @@ class VHelperWindow(Adw.ApplicationWindow):
 
     def _update_buttons(self):
         installed = self.shoost_exe is not None
-        self.launch_btn.set_sensitive(installed and self.shoost_proc is None)
+        runtime_safe = self.shoost_launch_runtime[0]
+        self.launch_btn.set_sensitive(
+            installed and runtime_safe and self.shoost_proc is None
+        )
         self.stop_btn.set_sensitive(self.shoost_proc is not None)
         self.uninstall_btn.set_sensitive(installed and self.shoost_proc is None)
         pwv_installed = is_obs_pwvideo_installed()
@@ -532,12 +654,24 @@ class VHelperWindow(Adw.ApplicationWindow):
         if not self.shoost_exe:
             self._log("Shoost not installed")
             return
+        self._poll_shoost_launch_runtime()
+        blocker = self.shoost_launch_runtime[2]
+        if blocker:
+            self._log(f"ERROR: {blocker}")
+            self._show_copy_dialog("Shoost Launch Blocked", blocker, blocker)
+            return
         cmd = f"protontricks-launch --appid {VTS_APPID} '{self.shoost_exe}'"
         self._show_copy_dialog("Terminal Command", cmd)
 
     def on_launch_shoost(self, _btn):
         if not self.shoost_exe or not self.shoost_exe.exists():
             self._log("ERROR: Shoost not installed")
+            return
+        self._poll_shoost_launch_runtime()
+        blocker = self.shoost_launch_runtime[2]
+        if blocker:
+            self._log(f"ERROR: {blocker}")
+            self._show_copy_dialog("Shoost Launch Blocked", blocker, blocker)
             return
 
         cmd = [

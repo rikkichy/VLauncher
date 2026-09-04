@@ -32,6 +32,20 @@ OR
 ```sh
 yay -S vhelper
 ```
+
+## Using Shoost
+
+Start VTube Studio from Steam before launching Shoost. VHelper checks the
+running VTube Studio process every two seconds and enables the Shoost launcher
+only when the configured `protontricks-launch` can use a compatible Wine
+runtime.
+
+Spout2 sender discovery requires VTube Studio and Shoost to share one Wine
+server. If VTube Studio is inside a private Steam container while Protontricks
+is configured without Steam Runtime support, VHelper reports the isolation and
+blocks the launch instead of starting a Shoost instance that cannot see the
+sender.
+
 ## Build
 
 > [!NOTE]
