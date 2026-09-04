@@ -5,7 +5,7 @@ pkgdesc='Make vtubing suck less on Linux'
 arch=('any')
 url='https://github.com/rikkichy/vhelper'
 license=('GPL-3.0-or-later')
-depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'protontricks')
+depends=('python' 'python-gobject' 'gtk4' 'libadwaita' 'protontricks' 'util-linux')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rikkichy/vhelper/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

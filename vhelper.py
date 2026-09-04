@@ -3,6 +3,7 @@
 import gi
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -175,61 +176,142 @@ def find_vts_process():
     return None
 
 
-def _protontricks_disables_steam_runtime(launcher):
-    """Detect wrappers that force protontricks out of Steam Runtime."""
-    try:
-        text = Path(launcher).read_text(errors="ignore")
-    except OSError:
-        return False
-    for line in text.splitlines():
-        normalized = line.replace(" ", "").replace("'", "").replace('"', "")
-        if normalized in ("STEAM_RUNTIME=0", "exportSTEAM_RUNTIME=0"):
-            return True
-    return False
+def _vts_uses_private_tmp(vts_pid):
+    """Return whether VTube Studio has a container-private /tmp."""
+    host_tmp = os.stat("/tmp")
+    vts_tmp = os.stat(f"/proc/{vts_pid}/root/tmp")
+    return (
+        host_tmp.st_dev != vts_tmp.st_dev
+        or host_tmp.st_ino != vts_tmp.st_ino
+    )
 
 
-def inspect_shoost_launch_runtime():
-    """Return (safe, summary, blocker) for launching Shoost right now."""
-    launcher = shutil.which("protontricks-launch")
-    if not launcher:
-        blocker = "protontricks-launch is not available."
-        return False, "protontricks-launch not found", blocker
+def _vts_proton_launcher(vts_pid):
+    """Return the Proton launcher used by the running VTube Studio process."""
+    proc_dir = Path(f"/proc/{vts_pid}")
+    tool_paths = _process_environment_value(
+        proc_dir, "STEAM_COMPAT_TOOL_PATHS"
+    )
+    if tool_paths:
+        for tool_path in tool_paths.split(os.pathsep):
+            candidate = Path(tool_path) / "proton"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
 
+    configured = detect_proton_from_config()
+    if configured:
+        candidate = configured / "proton"
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _vts_namespace_command(vts_pid, argv):
+    """Build a command that executes argv inside VTube Studio's container."""
+    nsenter = shutil.which("nsenter")
+    if not nsenter:
+        return None
+    return [
+        nsenter,
+        "--target", str(vts_pid),
+        "--user",
+        "--mount",
+        "--preserve-credentials",
+        "--env",
+        "--root",
+        "--wd",
+        "--",
+        "/usr/bin/env",
+        "-u", "WINESERVERSOCKET",
+        *map(str, argv),
+    ]
+
+
+def build_shoost_launch_command(shoost_exe=None):
+    """Return (command, summary, blocker) for launching Shoost right now."""
     vts_pid = find_vts_process()
     if vts_pid is None:
         blocker = (
             "VTube Studio is not running. Start it from Steam before launching "
-            "Shoost so VHelper can verify that both applications will share "
-            "the same Wine runtime."
+            "Shoost so both applications can share one Wine runtime."
         )
-        return False, "Not running", blocker
+        return None, "Not running", blocker
 
     try:
-        host_tmp = os.stat("/tmp")
-        vts_tmp = os.stat(f"/proc/{vts_pid}/root/tmp")
-        private_runtime = (
-            host_tmp.st_dev != vts_tmp.st_dev
-            or host_tmp.st_ino != vts_tmp.st_ino
-        )
-    except (OSError, PermissionError):
+        private_runtime = _vts_uses_private_tmp(vts_pid)
+    except OSError:
         blocker = (
             f"VTube Studio is running as PID {vts_pid}, but VHelper cannot "
             "inspect its Steam Runtime. Shoost was not launched because "
             "Spout2 requires both applications to share one Wine server."
         )
-        return False, f"Runtime inspection failed (PID {vts_pid})", blocker
+        return None, f"Runtime inspection failed (PID {vts_pid})", blocker
 
-    if private_runtime and _protontricks_disables_steam_runtime(launcher):
-        blocker = (
-            "VTube Studio is running in a private Steam container, while this "
-            "protontricks-launch package disables Steam Runtime. Launching "
-            "Shoost would create a second Wine server, so it cannot see VTube "
-            "Studio's Spout2 sender. Launch both applications from one "
-            "Steam/Proton runtime instead."
+    if private_runtime:
+        nsenter = shutil.which("nsenter")
+        if not nsenter:
+            blocker = (
+                "VTube Studio is running in a private Steam container, but "
+                "nsenter is not available. Install util-linux so VHelper can "
+                "launch Shoost in VTube Studio's runtime."
+            )
+            return None, f"nsenter not found (PID {vts_pid})", blocker
+
+        proton = _vts_proton_launcher(vts_pid)
+        if not proton:
+            blocker = (
+                f"VTube Studio is running as PID {vts_pid}, but VHelper cannot "
+                "locate the Proton launcher used by that process."
+            )
+            return None, f"Proton launcher not found (PID {vts_pid})", blocker
+
+        command = _vts_namespace_command(vts_pid, [proton, "run"])
+        if shoost_exe is not None:
+            command.append(str(shoost_exe))
+        return (
+            command,
+            f"Shared runtime launcher ready (PID {vts_pid})",
+            None,
         )
-        return False, f"Isolated from protontricks (PID {vts_pid})", blocker
 
-    return True, f"Compatible runtime detected (PID {vts_pid})", None
+    launcher = shutil.which("protontricks-launch")
+    if not launcher:
+        blocker = "protontricks-launch is not available."
+        return None, "protontricks-launch not found", blocker
+
+    command = [launcher, "--appid", VTS_APPID]
+    if shoost_exe is not None:
+        command.append(str(shoost_exe))
+    return command, f"Compatible runtime detected (PID {vts_pid})", None
+
+
+def build_shoost_stop_command(shoost_exe):
+    """Build a taskkill command for a Shoost process in VTS's container."""
+    vts_pid = find_vts_process()
+    if vts_pid is None:
+        return None
+    try:
+        if not _vts_uses_private_tmp(vts_pid):
+            return None
+    except OSError:
+        return None
+
+    proton = _vts_proton_launcher(vts_pid)
+    if not proton:
+        return None
+    wine = proton.parent / "files/bin/wine"
+    if not wine.is_file():
+        return None
+    return _vts_namespace_command(
+        vts_pid,
+        [wine, "taskkill", "/F", "/IM", shoost_exe.name],
+    )
+
+
+def inspect_shoost_launch_runtime():
+    """Return (safe, summary, blocker) for launching Shoost right now."""
+    command, summary, blocker = build_shoost_launch_command()
+    return command is not None, summary, blocker
 
 
 class VHelperWindow(Adw.ApplicationWindow):
@@ -516,7 +598,7 @@ class VHelperWindow(Adw.ApplicationWindow):
     def _update_proton_status(self):
         self.proton_path = detect_proton_from_config()
         name = self.proton_path.name if self.proton_path else "Not detected"
-        ok = bool(self.proton_path and (self.proton_path / "files/bin/wine64").exists())
+        ok = bool(self.proton_path and (self.proton_path / "files/bin/wine").exists())
         self._set_row_status(self.proton_row, name, ok)
 
     def _update_shoost_status(self):
@@ -655,32 +737,25 @@ class VHelperWindow(Adw.ApplicationWindow):
             self._log("Shoost not installed")
             return
         self._poll_shoost_launch_runtime()
-        blocker = self.shoost_launch_runtime[2]
+        cmd, _summary, blocker = build_shoost_launch_command(self.shoost_exe)
         if blocker:
             self._log(f"ERROR: {blocker}")
             self._show_copy_dialog("Shoost Launch Blocked", blocker, blocker)
             return
-        cmd = f"protontricks-launch --appid {VTS_APPID} '{self.shoost_exe}'"
-        self._show_copy_dialog("Terminal Command", cmd)
+        self._show_copy_dialog("Terminal Command", shlex.join(cmd))
 
     def on_launch_shoost(self, _btn):
         if not self.shoost_exe or not self.shoost_exe.exists():
             self._log("ERROR: Shoost not installed")
             return
         self._poll_shoost_launch_runtime()
-        blocker = self.shoost_launch_runtime[2]
+        cmd, summary, blocker = build_shoost_launch_command(self.shoost_exe)
         if blocker:
             self._log(f"ERROR: {blocker}")
             self._show_copy_dialog("Shoost Launch Blocked", blocker, blocker)
             return
 
-        cmd = [
-            "protontricks-launch",
-            "--appid", VTS_APPID,
-            str(self.shoost_exe),
-        ]
-
-        self._log(f"Launching {self.shoost_exe.name} via protontricks-launch")
+        self._log(f"Launching {self.shoost_exe.name}: {summary}")
 
         try:
             self.shoost_proc = subprocess.Popen(
@@ -719,16 +794,33 @@ class VHelperWindow(Adw.ApplicationWindow):
         return False
 
     def on_stop_shoost(self, _btn):
-        if self.shoost_proc:
-            self._log("Stopping Shoost...")
+        if not self.shoost_proc:
+            return
+
+        self._log("Stopping Shoost...")
+        stop_cmd = build_shoost_stop_command(self.shoost_exe)
+        if stop_cmd:
+            try:
+                result = subprocess.run(
+                    stop_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode != 0:
+                    self._log(result.stdout.strip() or result.stderr.strip())
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self._log(f"ERROR: {e}")
+
+        if self.shoost_proc.poll() is None:
             self.shoost_proc.terminate()
             try:
                 self.shoost_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.shoost_proc.kill()
-            self._log("Stopped")
-            self.shoost_proc = None
-            self._update_buttons()
+        self._log("Stopped")
+        self.shoost_proc = None
+        self._update_buttons()
 
     def on_uninstall_shoost(self, _btn):
         if not SHOOST_DIR.exists():

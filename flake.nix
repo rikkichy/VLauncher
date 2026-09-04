@@ -38,15 +38,15 @@
             # The upstream bin/vhelper launcher searches /usr/local/share,
             # /usr/share and XDG_DATA_HOME -- none of which exist here.
             # Replace it with a direct wrapper that pins the right python
-            # (with PyGObject) and puts protontricks on PATH. dontWrapGApps
-            # + manual wrap is the documented pattern to avoid double
-            # wrapping while still getting GI/GSettings env from the hook.
+            # (with PyGObject) and puts protontricks and nsenter on PATH.
+            # dontWrapGApps + manual wrap is the documented pattern to avoid
+            # double wrapping while still getting GI/GSettings env from the hook.
             dontWrapGApps = true;
             preFixup = ''
               rm $out/bin/vhelper
               makeWrapper ${pythonEnv}/bin/python3 $out/bin/vhelper \
                 --add-flags "$out/share/vhelper/vhelper.py" \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.protontricks ]} \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.protontricks pkgs.util-linux ]} \
                 "''${gappsWrapperArgs[@]}"
             '';
 

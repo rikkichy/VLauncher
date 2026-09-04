@@ -37,14 +37,13 @@ yay -S vhelper
 
 Start VTube Studio from Steam before launching Shoost. VHelper checks the
 running VTube Studio process every two seconds and enables the Shoost launcher
-only when the configured `protontricks-launch` can use a compatible Wine
-runtime.
+when it can share that process's Wine runtime.
 
 Spout2 sender discovery requires VTube Studio and Shoost to share one Wine
-server. If VTube Studio is inside a private Steam container while Protontricks
-is configured without Steam Runtime support, VHelper reports the isolation and
-blocks the launch instead of starting a Shoost instance that cannot see the
-sender.
+server. When VTube Studio uses a private Steam container, VHelper uses
+`nsenter` to launch Shoost in the running process's user and mount namespaces.
+The inherited `WINESERVERSOCKET` descriptor is removed so Wine reconnects
+through the shared container socket.
 
 ## Build
 
@@ -64,5 +63,5 @@ makepkg -si
 ## Dependencies
 
 - `python`, `python-gobject`, `gtk4`, `libadwaita`
-- `protontricks`
+- `protontricks`, `util-linux` (`nsenter`)
 - OBS Studio. `obs-pwvideo` is bundled, but if the bundled binary's `libobs.so` major doesn't match your OBS, fall back to your distro's package (e.g. [`obs-pwvideo`](https://aur.archlinux.org/packages/obs-pwvideo) on the AUR).
